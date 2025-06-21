@@ -57,10 +57,10 @@ app.use(bodyParser.json());
 function logData(req, res, next) {
     // Limit body size in logs to prevent console flooding
     const bodyString = JSON.stringify(req.body);
-    const truncatedBody = bodyString.length > 1000
-        ? bodyString.substring(0, 1000) + '... [truncated]'
+    const truncatedBody = bodyString.length > 1000 
+        ? bodyString.substring(0, 1000) + '... [truncated]' 
         : bodyString;
-
+    
     // console.log("method:", req.method, "url:", req.url);
     // console.log("body:", truncatedBody);
     // console.log("headers:", req.headers);
@@ -102,7 +102,7 @@ const lock = new AsyncLock();
 cron.schedule('*/20 * * * * *', () => {
     if (accumulatedRecords.length > 0) {
         // console.log(`Cron job running: Processing ${accumulatedRecords.length} accumulated records`);
-
+        
         // Check if lock is already acquired before processing
         if (!lock.isBusy('accumulatedRecords')) {
             doProcessRecords();
@@ -116,14 +116,9 @@ cron.schedule('*/20 * * * * *', () => {
 async function doProcessRecords() {
     await lock.acquire('accumulatedRecords', async () => {
         // Group records by templateField and journeyId
-        const templateIdToName = templates.reduce((map, t) => {
-            map[t.id] = t.name;
-            return map;
-        }, {});
         const groupedRecords = {};
         for (const record of accumulatedRecords) {
-            const templateName = templates.find(t => t.id === record.templateField)?.name || record.templateField; // Get name or fallback to templateField
-            const key = `${templateName}_${record.journeyId}`;
+            const key = `${record.templateField}_${record.journeyId}`;
             if (!groupedRecords[key]) {
                 groupedRecords[key] = [];
             }
@@ -139,7 +134,7 @@ async function doProcessRecords() {
             let batch = [];
             let batchCount = 0;
             const batchStartTime = Date.now();
-
+            // console.log(groupedRecords);
             // Process in batches of 20
             while (records.length > 0) {
                 batch = records.splice(0, 20);
@@ -167,40 +162,114 @@ async function doProcessRecords() {
 async function processBatch(batch, templateField, journeyId) {
     // console.log(`Processing batch of ${batch.length} records for template "${templateField}" and journey "${journeyId}".`);
 
+    // Declare variables at the beginning to avoid reference errors
+    let templateName = 'Unknown';
+    let journeyName = 'Unknown';
+    let placeholders = [];
+
+    // Extract journey name from the first record in the batch
+    const firstRecord = batch[0];
+    if (firstRecord && firstRecord.templateName && firstRecord.sprinklrJourneyName) {
+        templateName = firstRecord.templateName;
+        journeyName = firstRecord.sprinklrJourneyName;
+    }
+
+    // Step 1: Fetch template details to get the name and placeholders
+    try {
+        const token = await getSprinklrToken();
+        const templateData = await fetchTemplateByIdFromSprinklr(templateField, token);
+        // console.log('Full templateData response:', JSON.stringify(templateData, null, 2));
+        if (templateData && templateData.data && templateData.data.results.length > 0) {
+            const template = templateData.data.results[0];
+            templateName = template.name; // Get the template name
+            if (template.templateAsset && template.templateAsset.attachment && template.templateAsset.attachment.placeholders) {
+                placeholders = template.templateAsset.attachment.placeholders;
+                // console.log(placeholders);
+            }
+        } else {
+            // console.log(`Could not find template details for ID: ${templateField}`);
+        }
+    } catch (error) {
+        // console.log(`Error fetching template details for ID ${templateField}:`, error.message);
+        // Continue processing with a default template name, or you could return early
+    }
+
+    // Step 2: Log the batch processing with the fetched template name
+    console.log(`Processing batch of ${batch.length} records for template "${templateName}" (${templateField}) and journey "${journeyId}".`);
+
     const validRecords = batch.filter(deRow => deRow.phoneData);
     if (validRecords.length !== batch.length) {
         // console.log(`Filtered out ${batch.length - validRecords.length} records without phoneData`);
     }
 
-    // Build payload
+    // Step 3: Create a case-insensitive map of placeholders to ensure correct capitalization
+    const placeholderMap = placeholders.reduce((acc, placeholder) => {
+        if (placeholder.displayName) {
+            acc[placeholder.displayName.toLowerCase()] = placeholder.displayName;
+        }
+        return acc;
+    }, {});
+
+    // console.log('Placeholder mapping:', placeholderMap);
+
+    if (validRecords.length !== batch.length) {
+        // console.log(`Filtered out ${batch.length - validRecords.length} records without phoneData`);
+    }
+
+    // Build payload with enhanced error handling
     const contacts = validRecords.map((deRow) => {
-        if (!deRow.phoneData) {
-            // console.log('Skipping record without phoneData:', deRow);
+        try {
+            // Validate deRow structure
+            if (!deRow || typeof deRow !== 'object') {
+                console.log('Invalid deRow structure:', deRow);
+                return null;
+            }
+
+            if (!deRow.phoneData) {
+                console.log('Skipping record without phoneData:', deRow);
+                return null;
+            }
+
+            // Step 4: Build contextParams with proper case matching
+            const contextParams = {
+                ...Object.entries(deRow.dynamicData || {}).reduce((acc, [key, value]) => {
+                    try {
+                        // Find the correct placeholder name using case-insensitive matching
+                        const lowerKey = key.toLowerCase();
+                        const correctPlaceholderName = placeholderMap[lowerKey] || key;
+                        
+                        // console.log(`Mapping "${key}" to "${correctPlaceholderName}" with value "${value}"`);
+                        acc[correctPlaceholderName] = value || `Missing value for ${correctPlaceholderName}`;
+                        return acc;
+                    } catch (error) {
+                        console.log(`Error processing dynamic data key "${key}":`, error.message);
+                        return acc;
+                    }
+                }, {})
+            };
+
+            return {
+                unifiedProfile: {
+                    contact: {},
+                    profiles: [
+                        {
+                            channelType: "WHATSAPP_BUSINESS",
+                            channelId: deRow.phoneData
+                        }
+                    ]
+                },
+                contextParams
+            };
+        } catch (error) {
+            console.log('Error processing record:', error.message, 'Record:', deRow);
             return null;
         }
-        const contextParams = {
-            ...Object.entries(deRow.dynamicData || {}).reduce((acc, [key, value]) => {
-                acc[key] = value || `Missing value for ${key}`;
-                return acc;
-            }, {})
-        };
-        return {
-            unifiedProfile: {
-                contact: {},
-                profiles: [
-                    {
-                        channelType: "WHATSAPP_BUSINESS",
-                        channelId: deRow.phoneData
-                    }
-                ]
-            },
-            contextParams
-        };
-    }).filter(Boolean); // Remove null entries
+    }).filter(contact => contact !== null && contact !== undefined); // More explicit filtering
+
 
     const payload = {
         journeyId: journeyId,
-        globalContextParams: { IGNORE_DEDUP: true, var1: templateField },
+        globalContextParams: {IGNORE_DEDUP: true, var1: templateField },
         journeyProfiles: contacts
     };
     // console.log('***Payload:', payload);
@@ -212,23 +281,31 @@ async function processBatch(batch, templateField, journeyId) {
     while (retryCount < maxRetries) {
         try {
             const token = await getSprinklrToken();
-            const response = await handleSprinklrRequest(() =>
-                axios.post('https://api3.sprinklr.com/api/v2/marketing-journey/bulk-trigger', payload, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${token}`,
-                        'workspace_id': '9264'
-                    }
-                })
-            );
+
+            const response = await handleSprinklrRequest(() => {
+              // console.log('Original Payload:', JSON.stringify(payload).substring(0, MAX_LENGTH));
+              return axios.post(
+                'https://api3.sprinklr.com/api/v2/marketing-journey/bulk-trigger',
+                payload,
+                {
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                    'workspace_id': '9264'
+                  }
+                }
+              );
+            });
+            
 
             totalProcessedRecords += validRecords.length;
 
-            if (validRecords.length > 0 && templateField && journeyId) {
-                const key = `${templateField}_${journeyId}`;
+            // Updated tracking to use templateName and journeyName
+            if (validRecords.length > 0 && templateName && journeyName) {
+                const key = `${templateName}_${journeyName}`;
                 processedByTemplateAndJourneyCounts[key] = (processedByTemplateAndJourneyCounts[key] || 0) + validRecords.length;
                 const timestampedKey = `${key}_${new Date().toISOString()}`;
-
+            
                 // Initialize as array if it doesn't exist, then push new response.data
                 if (!Array.isArray(Sprinklr[key])) {
                     Sprinklr[key] = [];
@@ -237,11 +314,12 @@ async function processBatch(batch, templateField, journeyId) {
                     timestamp: new Date().toISOString(),
                     data: response?.data
                 });
-
+            
                 // You can still keep the timestampedKey if you want individual entries as well
                 Sprinklr[timestampedKey] = response?.data;
             }
 
+            
 
             return { success: true };
         } catch (error) {
@@ -297,7 +375,8 @@ async function processBatch(batch, templateField, journeyId) {
 
 // Main /journeybuilder/execute route logic
 app.post('/journeybuilder/execute/', async (req, res) => {
-
+    // console.log('Request Body:', req.body);  // Logging the entire request body
+    
     // Increment the received records counter
     totalReceivedRecords++;
 
@@ -306,26 +385,27 @@ app.post('/journeybuilder/execute/', async (req, res) => {
         const phoneNumberField = inArguments.find(arg => arg.phoneNumberField)?.phoneNumberField;
         const templateField = inArguments.find(arg => arg.templateField)?.templateField;
         const journeyId = inArguments.find(arg => arg.journeyField)?.journeyField;
+        const templateName = inArguments.find(arg => arg.templateName)?.templateName;
+        const sprinklrJourneyName = inArguments.find(arg => arg.sprinklrJourneyName)?.sprinklrJourneyName;
         const dynamicFields = inArguments.find(arg => arg.dynamicFields)?.dynamicFields || {};
         const phoneData = inArguments.find(arg => arg.PhoneData)?.PhoneData;
         const dynamicData = inArguments.find(arg => arg.DynamicData)?.DynamicData || {};
 
-        // ADD THIS CODE HERE (around line 227)
-        if (templateField && journeyId) {
-            const key = `${templateField}_${journeyId}`;
+        if (templateName && sprinklrJourneyName) {
+            const key = `${templateName}_${sprinklrJourneyName}`;
             receivedByTemplateAndJourneyCounts[key] = (receivedByTemplateAndJourneyCounts[key] || 0) + 1;
         }
 
         // Update templateField counts
         if (templateField) {
-            templateFieldCounts[templateField] = (templateFieldCounts[templateField] || 0) + 1;
+            templateFieldCounts[templateName] = (templateFieldCounts[templateName] || 0) + 1;
         }
 
         // Update journeyId counts
-        if (journeyId) {
-            journeyIdCounts[journeyId] = (journeyIdCounts[journeyId] || 0) + 1;
+        if (sprinklrJourneyName) {
+            journeyIdCounts[sprinklrJourneyName] = (journeyIdCounts[sprinklrJourneyName] || 0) + 1;
         }
-
+        
         // Count records received without a phone number
         if (!phoneNumberField || !phoneData) {
             totalNoPhoneNumberRecords++;
@@ -338,6 +418,8 @@ app.post('/journeybuilder/execute/', async (req, res) => {
             templateField: templateField,
             journeyId: journeyId,
             dynamicFields: dynamicFields,
+            templateName: templateName,
+            sprinklrJourneyName: sprinklrJourneyName,
             id: uuidv4() // Ensure each record has a unique ID
         });
 
@@ -348,7 +430,7 @@ app.post('/journeybuilder/execute/', async (req, res) => {
         // No need to call scheduleProcessing() as we're using a cron job now
 
     } catch (error) {
-        console.log('Error executing journey:', error.message);
+        // console.log('Error executing journey:', error.message);
         res.status(500).json({ error: 'Error processing journey execution' });
     }
 });
@@ -438,7 +520,7 @@ app.post('/sprinklr/journeys', async (req, res) => {
 
                 return res.status(200).json({ data: journeys });
             } catch (error) {
-                console.log(`Attempt ${attempt} failed:`, error.message);
+                // console.log(`Attempt ${attempt} failed:`, error.message);
 
                 if (attempt === maxRetries) {
                     return res.status(500).json({
@@ -456,7 +538,7 @@ app.post('/sprinklr/journeys', async (req, res) => {
                             }
                         });
                     } catch (tokenError) {
-                        console.log('Error renewing token:', tokenError.message);
+                        // console.log('Error renewing token:', tokenError.message);
                     }
                 }
 
@@ -465,9 +547,9 @@ app.post('/sprinklr/journeys', async (req, res) => {
             }
         }
 
-        console.log('Max retries reached without successful response');
+        // console.log('Max retries reached without successful response');
     } catch (error) {
-        console.log('All retry attempts failed:', error.message);
+        // console.log('All retry attempts failed:', error.message);
         res.status(500).json({
             error: 'Failed to load journeys',
             details: error.message
@@ -518,7 +600,7 @@ app.get('/sfmcjourney/:journeyId', async (req, res) => {
                 res.json(consolidatedData);
             });
         } else {
-            console.log('Error fetching journey details:', error.message || error);
+            // console.log('Error fetching journey details:', error.message || error);
             res.status(500).json({ error: 'Error fetching journey details' });
         }
     }
@@ -543,7 +625,7 @@ app.get('/data-extension-fields', async (req, res) => {
         });
 
         if (!response.ok) {
-            console.log(`Network response was not ok: ${response.statusText}`);
+            // console.log(`Network response was not ok: ${response.statusText}`);
         }
 
         const data = await response.json(); // Parse the response to JSON
@@ -556,7 +638,7 @@ app.get('/data-extension-fields', async (req, res) => {
             res.status(404).send({ error: 'No fields found in the Data Extension' });
         }
     } catch (error) {
-        console.log('Failed to load data extension fields:', error);
+        // console.log('Failed to load data extension fields:', error);
         res.status(500).send({ error: 'Failed to load data extension fields' });
     }
 });
@@ -587,7 +669,7 @@ app.get('/templates', async (req, res) => {
                     return res.json({ templates });
                 }
 
-                console.log(`Attempt ${attempt}: Invalid response structure`);
+                // console.log(`Attempt ${attempt}: Invalid response structure`);
 
                 if (attempt === maxRetries) {
                     return res.status(502).json({
@@ -606,7 +688,7 @@ app.get('/templates', async (req, res) => {
                 await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
                 continue;
             } catch (error) {
-                console.log(`Attempt ${attempt} failed:`, error.message);
+                // console.log(`Attempt ${attempt} failed:`, error.message);
 
 
                 // Get new token and retry for any error
@@ -957,7 +1039,7 @@ async function handleSprinklrRequest(requestFn) {
         return response;
     } catch (error) {
         console.log(error.status);
-
+        
         // Return error payload wrapped in success: false
         return error.response;
     }
